@@ -1,0 +1,742 @@
+/*
+ * Title:        IoTSim-Osmosis 1.0
+ * Description:  IoTSim-Osmosis enables the testing and validation of osmotic computing applications 
+ * 			     over heterogeneous edge-cloud SDN-aware environments.
+ * 
+ * Licence:      GPL - http://www.gnu.org/copyleft/gpl.html
+ *
+ * Copyright (c) 2020, Newcastle University (UK) and Saudi Electronic University (Saudi Arabia) 
+ * 
+ */
+
+
+package org.cloudbus.cloudsim.edge.core.edge;
+
+
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Hashtable;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Random;
+
+import org.cloudbus.cloudsim.DatacenterCharacteristics;
+import org.cloudbus.cloudsim.Storage;
+import org.cloudbus.cloudsim.Vm;
+import org.cloudbus.cloudsim.VmAllocationPolicy;
+import org.cloudbus.cloudsim.core.CloudSim;
+import org.cloudbus.cloudsim.core.SimEvent;
+import org.cloudbus.cloudsim.core.predicates.PredicateType;
+import org.cloudbus.cloudsim.edge.core.edge.EdgeDevice;
+import org.cloudbus.cloudsim.edge.core.edge.ConfiguationEntity.HostEntity;
+import org.cloudbus.cloudsim.edge.core.edge.ConfiguationEntity.LinkEntity;
+import org.cloudbus.cloudsim.edge.core.edge.ConfiguationEntity.SwitchEntity;
+import org.cloudbus.osmosis.core.Flow;
+import org.cloudbus.osmosis.core.OsmesisAppDescription;
+import org.cloudbus.osmosis.core.OsmesisBroker;
+import org.cloudbus.osmosis.core.OsmesisDatacenter;
+import org.cloudbus.osmosis.core.OsmosisTags;
+import org.cloudbus.osmosis.core.Topology;
+
+import ir.arkatec.fso.FSOAlgorithm;
+import ir.arkatec.fso.RedBug;
+import ir.arkatec.genetic.GAGWOAlgorithm;
+import ir.arkatec.genetic.GWOAlgorithm;
+import ir.arkatec.genetic.Gene;
+import ir.arkatec.genetic.GeneticAlgorithm;
+
+import org.cloudbus.cloudsim.sdn.SDNHost;
+import org.cloudbus.cloudsim.sdn.Switch;
+
+
+public class EdgeDataCenter extends OsmesisDatacenter{
+	
+	private List<Flow> flowList = new ArrayList<>(); 
+	private List<Flow> flowListHis = new ArrayList<>(); 
+	private double a_queue=0.3;
+	private double a_exe=0.3;
+	private double a_bw=0.3;
+	
+	public EdgeDataCenter(String name, DatacenterCharacteristics characteristics,
+			VmAllocationPolicy vmAllocationPolicy, List<Storage> storageList, double schedulingInterval)
+			throws Exception {
+		super(name, characteristics, vmAllocationPolicy, storageList, schedulingInterval);
+	}
+
+	@Override
+	public void processEvent(SimEvent ev) {
+		// TODO Auto-generated method stub
+		
+		super.processEvent(ev);
+
+	}
+	private double lastTime=-1;
+	private List<SimEvent> inTimeEvent=new ArrayList<>(); 
+	private List<Flow> inTimeFlow=new ArrayList<>(); 
+
+	@Override
+	public void processOtherEvent(SimEvent ev) {
+		int tag = ev.getTag();
+		
+		switch (tag) {
+		case OsmosisTags.TRANSMIT_IOT_DATA:
+			
+			this.beforTransferIoTData(ev);
+			break;
+			
+		case OsmosisTags.INTERNAL_EVENT:
+			updateFlowTransmission();
+			break;			
+			
+		case OsmosisTags.BUILD_ROUTE:
+			sendMelDataToClouds(ev);
+			break;
+			
+		default:			
+			System.out.println("Unknown event recevied by SDNDatacenter. Tag:"+ev.getTag());		
+			break;
+		}
+	}	
+
+	private void sendMelDataToClouds(SimEvent ev) {
+		Flow flow  = (Flow) ev.getData();
+		sendNow(this.getSdnController().getId(), OsmosisTags.BUILD_ROUTE, flow);
+	}
+
+	public void updateFlowTransmission() {		
+		LinkedList<Flow> finshedFlows = new LinkedList<>();
+		for(Flow flow : this.flowList){
+			boolean isCompleted = flow.updateTransmission();						
+			if(isCompleted){
+				finshedFlows.add(flow);				
+			}			
+		}
+		
+		if(finshedFlows.size() != 0){
+			this.flowList.removeAll(finshedFlows);
+			
+			for(Vm vm : this.getVmList()){
+				MEL mel = (MEL) vm;				
+				this.removeFlows(mel, finshedFlows);				
+				mel.updateAssociatedIoTDevices(); // update MEL Bw					
+			}
+			for(Flow flow : finshedFlows){
+				// update IoT device Bw
+				int tagRemoveFlow = OsmosisTags.updateIoTBW;		
+				sendNow(flow.getOrigin(), tagRemoveFlow, flow); // tell IoT device to update its bandwidth by removing this finished flow
+												
+				int tag = OsmosisTags.Transmission_ACK;		
+				sendNow(OsmesisBroker.brokerID, tag, flow);
+			}
+			
+			updateAllFlowsBw();
+		}		
+		
+		determineEarliestFinishingFlow();
+	}
+	
+	private void updateAllFlowsBw(){
+		// update the destination Bw of every flow 
+		
+		for(Flow flow : this.flowList){
+			for(Vm vm : this.getVmList()){
+			MEL mel = (MEL) vm;															
+				if(flow.getDestination()  == mel.getId() ){
+					mel.updateAssociatedIoTDevices();
+					double melCurrentBw = mel.getCurrentBw();
+					flow.updateDestBw(melCurrentBw);
+				}
+			}
+		}
+		
+		// update the main bw of every flow
+		for(Flow getFlow : this.flowList){
+			getFlow.updateBandwidth();
+//			System.out.println(CloudSim.clock + " the flow " + getFlow.getFlowId() + " left data to be transferred is " + getFlow.getAmountToBeProcessed() + 
+//					"; and BW is " + getFlow.getFlowBandwidth());
+		}
+	}
+	
+	private void removeFlows(MEL mel, LinkedList<Flow> finshedFlows) {
+		LinkedList<Flow> removedList = new LinkedList<>();
+		for (Flow flow : mel.getFlowList()){
+			for (Flow removedFlow : finshedFlows){
+				if(flow.getFlowId() == removedFlow.getFlowId()){
+					removedList.add(flow);
+				}
+			}
+		}
+		mel.removeFlows(removedList);
+		removedList.clear();
+	}
+
+	private String getMelNameById(Flow flow ) {
+		String vmName="";
+				 for(int j=0;j<this.getVmList().size();j++) {
+					 if(this.getVmList().get(j).getId()==flow.getDestination()) {
+						 vmName=this.getVmList().get(j).getVmName();
+					 }
+				 }
+				 
+	
+		return vmName;
+	}
+	private String algorithm="fso"; //greedy//semigreedy//genetic //gwo//fso//gagwo
+	private int c =0;
+	private void CalUtilizationMips(int vmId,long edgeletSize) {
+		for (int i = 0; i < this.getVmList().size(); i++) {
+			MEL mel = (MEL)this.getVmList().get(i);
+			if (mel.getId()==vmId) {
+				if(mel.getFlowList().size()==0) {
+					List<Double> utilizationMips =mel.getUtilizationMips();
+					double s2=edgeletSize/mel.getMips();
+					utilizationMips.add(edgeletSize/mel.getMips());
+					mel.setUtilizationMips(utilizationMips);
+					mel.setSumUtilizationMips(mel.getSumUtilizationMips()+s2);
+					mel.setSumMipsAllocated(mel.getSumMipsAllocated()+edgeletSize);
+					List<Long> mipsAllocated=mel.getMipsAllocated();
+					mipsAllocated.add(edgeletSize);
+					mel.setMipsAllocated(mipsAllocated);
+				}else {
+					double s = 0;
+					for (int j = 0; j < mel.getFlowList().size(); j++) {
+						s+=mel.getFlowList().get(j).getOsmesisEdgeletSize();
+						
+					}
+					if (s>=mel.getMips()) {
+						
+						List<Double> utilizationMips =mel.getUtilizationMips();
+						utilizationMips.add((double) 1);
+						mel.setUtilizationMips(utilizationMips);
+						mel.setSumUtilizationMips(mel.getSumUtilizationMips()+1);
+						mel.setSumMipsAllocated(mel.getSumMipsAllocated()+edgeletSize);
+					}else {
+						
+						List<Double> utilizationMips =mel.getUtilizationMips();
+						double s2=s/mel.getMips();
+						utilizationMips.add(s2);
+						mel.setUtilizationMips(utilizationMips);
+						mel.setSumUtilizationMips(mel.getSumUtilizationMips()+s2);
+						mel.setSumMipsAllocated(mel.getSumMipsAllocated()+edgeletSize);
+					}
+				}
+			}
+			
+		}
+	}
+	
+	private void beforTransferIoTData(SimEvent ev) {
+		Flow flow = (Flow) ev.getData();
+		
+//		if(flow.getSubmitTime()>lastTime)
+		if(c==10)
+		{
+			c++;
+//			System.out.println(c);
+			//run genetic algorithm
+			if(algorithm=="gagwo") {
+				if(inTimeFlow.size()>0) {
+					GAGWOAlgorithm genetic = new GAGWOAlgorithm(this.getVmList(),inTimeFlow);
+					List<Gene> alocate=genetic.Run();
+					for(int i=0;i<alocate.size();i++) {
+						for(int j=0;j<inTimeEvent.size();j++) {
+							Flow f = (Flow) inTimeEvent.get(j).getData();
+							if(alocate.get(i).getCloudletFromGene().getFlowId()==f.getFlowId()){
+								f.setDestination(alocate.get(i).getVmFromGene().getId());
+								f.setAppNameDest(getMelNameById(f));
+								CalUtilizationMips(alocate.get(i).getVmFromGene().getId(),f.getOsmesisEdgeletSize());
+								
+							}
+						}
+						
+					}
+				}
+				
+			}else if(algorithm=="gwo") {
+				if(inTimeFlow.size()>0) {
+					GWOAlgorithm genetic = new GWOAlgorithm(this.getVmList(),inTimeFlow);
+					List<Gene> alocate=genetic.Run();
+					for(int i=0;i<alocate.size();i++) {
+						for(int j=0;j<inTimeEvent.size();j++) {
+							Flow f = (Flow) inTimeEvent.get(j).getData();
+							if(alocate.get(i).getCloudletFromGene().getFlowId()==f.getFlowId()){
+								f.setDestination(alocate.get(i).getVmFromGene().getId());
+								f.setAppNameDest(getMelNameById(f));
+								CalUtilizationMips(alocate.get(i).getVmFromGene().getId(),f.getOsmesisEdgeletSize());
+								
+							}
+						}
+						
+					}
+				}
+				
+			}else if(algorithm=="genetic") {
+				if(inTimeFlow.size()>0) {
+					GeneticAlgorithm genetic = new GeneticAlgorithm(this.getVmList(),inTimeFlow);
+					List<Gene> alocate=genetic.Run();
+					for(int i=0;i<alocate.size();i++) {
+						for(int j=0;j<inTimeEvent.size();j++) {
+							Flow f = (Flow) inTimeEvent.get(j).getData();
+							if(alocate.get(i).getCloudletFromGene().getFlowId()==f.getFlowId()){
+								f.setDestination(alocate.get(i).getVmFromGene().getId());
+								f.setAppNameDest(getMelNameById(f));
+								CalUtilizationMips(alocate.get(i).getVmFromGene().getId(),f.getOsmesisEdgeletSize());
+							}
+						}
+						
+					}
+				}
+				
+			}else if(algorithm=="fso") {
+				if(inTimeFlow.size()>0) {
+					
+					FSOAlgorithm fso = new FSOAlgorithm(this.getVmList(),inTimeFlow);
+					List<RedBug> alocate=fso.Run();
+					//System.out.println(alocate);
+					
+					for (int i = 0; i < alocate.size(); i++) {
+						Flow f = (Flow) inTimeEvent.get(i).getData();
+						f.setDestination(this.getVmList().get(alocate.get(i).getX()).getId());
+						f.setAppNameDest(getMelNameById(f));
+						CalUtilizationMips(this.getVmList().get(alocate.get(i).getX()).getId(),f.getOsmesisEdgeletSize());
+					}
+//					for (int j = 0; j < inTimeEvent.size(); j++) {
+//						Flow f = (Flow) inTimeEvent.get(j).getData();
+//						f.setDestination(this.getVmList().get(alocate).getId());
+//						f.setAppNameDest(getMelNameById(f));
+//					}
+							
+						
+						
+					
+				}
+				
+			}else if(algorithm=="semigreedy") {
+				
+				if(inTimeFlow.size()>0) {
+					
+					Collections.sort(inTimeFlow, new Comparator<Flow>() {
+
+				        public int compare(Flow o1, Flow o2) {
+				            // compare two instance of `Score` and return `int` as result.
+				        	return Double.compare(o1.getDeadline(), o2.getDeadline());
+				        }
+				    });
+					
+					System.out.println("ok");
+					for (int i = 0; i < inTimeEvent.size(); i++) {
+						double min_delay=Double.MAX_VALUE;
+						int bestMelId=-1;
+						List<MEL> dslist=new ArrayList<>();
+						List<MEL> uslist=new ArrayList<>();
+						Random random = new Random();
+						Double minD=Double.MAX_VALUE;
+						Flow f = (Flow) inTimeEvent.get(i).getData();
+						for(int j=0;j<this.getVmList().size()/2;j++) {
+							long sum_mips=0;
+							MEL mel = (MEL) this.getVmList().get(j);
+							for(int k=0;k<mel.getFlowList().size();k++) {
+								sum_mips += mel.getFlowList().get(k).getOsmesisEdgeletSize();		
+							}
+//							double d=(a_queue*(1/((f.getOsmesisEdgeletSize()/mel.getMips())-sum_mips)))+(a_exe*f.getOsmesisEdgeletSize()/mel.getMips())+
+//									(0.2*(f.getSize()/ mel.getCurrentBw()));
+							
+							double d=a_queue*(f.getOsmesisEdgeletSize()/(mel.getMips()-sum_mips))+a_exe*(f.getOsmesisEdgeletSize()/mel.getMips())+
+									a_bw*(f.getSize()/ mel.getCurrentAllocatedBw());
+							if(d>f.getDeadline()) {
+								uslist.add(mel);
+								if(minD>d-f.getDeadline()) {
+									minD=d-f.getDeadline();
+									bestMelId=mel.getId();
+								}
+							}else {
+								dslist.add(mel);
+								
+							}
+							
+//							if(d<min_delay) {
+//								bestMelId=mel.getId();
+//								min_delay=d;
+//							}
+						}
+						if (dslist.size()>0) {
+							//semi
+//							for (int x = 0; x < dslist.size(); x++) {
+//								Double m= inTimeFlow.get(i).getOsmesisEdgeletSize()/dslist.get(x).getMips();
+//							}
+							int index1=random.nextInt((int) (1+dslist.size()*0.2)) % ((int) (1+dslist.size()*0.2));
+							
+							f.setDestination(dslist.get(index1).getId());
+							f.setAppNameDest(getMelNameById(f));
+							CalUtilizationMips(dslist.get(index1).getId(),f.getOsmesisEdgeletSize());
+							
+						}else {
+							//min 
+							
+							f.setDestination(bestMelId);
+							f.setAppNameDest(getMelNameById(f));
+							CalUtilizationMips(bestMelId,f.getOsmesisEdgeletSize());
+						}
+						
+					}
+					
+//				
+//					
+//					FSOAlgorithm fso = new FSOAlgorithm(this.getVmList(),inTimeFlow);
+//					List<RedBug> alocate=fso.Run();
+//					//System.out.println(alocate);
+//					
+//					for (int i = 0; i < alocate.size(); i++) {
+//						Flow f = (Flow) inTimeEvent.get(i).getData();
+//						f.setDestination(this.getVmList().get(alocate.get(i).getX()).getId());
+//						f.setAppNameDest(getMelNameById(f));
+//						CalUtilizationMips(this.getVmList().get(alocate.get(i).getX()).getId(),f.getOsmesisEdgeletSize());
+//					}
+////					for (int j = 0; j < inTimeEvent.size(); j++) {
+////						Flow f = (Flow) inTimeEvent.get(j).getData();
+////						f.setDestination(this.getVmList().get(alocate).getId());
+////						f.setAppNameDest(getMelNameById(f));
+////					}
+//							
+//						
+//						
+//					
+				}
+				
+			}else if(algorithm=="x") {
+				
+			}
+			
+			
+			
+			///
+			for(int i=0;i<inTimeEvent.size();i++) {
+				
+				this.transferIoTData(inTimeEvent.get(i));
+			}
+			inTimeEvent.clear();
+			inTimeFlow.clear();
+			inTimeEvent.add(ev);
+			inTimeFlow.add((Flow) ev.getData());
+			lastTime=flow.getSubmitTime();
+			c=0;
+		}else {
+			inTimeEvent.add(ev);
+			inTimeFlow.add((Flow) ev.getData());
+			c++;
+		}
+		
+	}
+	
+	private void transferIoTData(SimEvent ev) {		
+		updateFlowTransmission();
+		
+		Flow flow = (Flow) ev.getData();
+		
+		flow.setDatacenterName(this.getName());
+		if(flow.getStartTime() == -1){
+			flow.setStartTime(CloudSim.clock());	
+		}	
+		
+		if (algorithm=="greedy") {
+		
+		//find best mel by BW
+		int bestMelId=-1;
+		int thresholdQueueForSendToCloud=20;
+		//for first run 
+		for(int i=0;i<this.getVmList().size()/2;i++) {
+			MEL mel = (MEL) this.getVmList().get(i);
+			
+			if (mel.getFlowList().size()==0 ){
+				bestMelId=mel.getId();
+				break;
+			}
+		}
+		
+		if(bestMelId==-1) {
+			double min_delay=Double.MAX_VALUE;
+			for(int i=0;i<this.getVmList().size()/2;i++) {
+				long sum_mips=0;
+				MEL mel = (MEL) this.getVmList().get(i);
+				for(int j=0;j<mel.getFlowList().size();j++) {
+					sum_mips += mel.getFlowList().get(j).getOsmesisEdgeletSize();		
+				}
+				double d=(a_queue*(1/((flow.getOsmesisEdgeletSize()/mel.getMips())-sum_mips)))+(a_exe*flow.getOsmesisEdgeletSize()/mel.getMips());
+	
+				if(d<min_delay) {
+					bestMelId=mel.getId();
+					min_delay=d;
+				}
+			}
+		}
+		flow.setDestination(bestMelId);
+		flow.setAppNameDest(getMelNameById(flow));
+		CalUtilizationMips(bestMelId,flow.getOsmesisEdgeletSize());
+		
+		}else if (algorithm=="ahp") {
+			//find best mel by BW
+			
+			int msize =this.getVmList().size()/2+1;
+			double[][] m1= new double[msize][msize];
+			double[][] m2= new double[msize][msize];
+			double[][] m3= new double[msize][msize];
+			long[] mips_use = new long[msize-1];
+			double[] mips = new double[msize-1];
+			double[] currentBw = new double[msize-1];
+			for(int i=0;i<this.getVmList().size()/2;i++) {
+				long sum_mips=0;
+				MEL mel = (MEL) this.getVmList().get(i);
+				for(int j=0;j<mel.getflowListHis().size();j++) {
+					sum_mips += mel.getflowListHis().get(j).getOsmesisEdgeletSize();		
+				}
+				mips_use[i]=sum_mips;
+				mips[i]=mel.getMips();
+				currentBw[i]=mel.getCurrentBw();
+				if(currentBw[i]==0) {
+					currentBw[i]=mel.getBw();
+				}
+			}
+			for(int i=0;i<this.getVmList().size()/2;i++) {
+				
+				for(int j=0;j<this.getVmList().size()/2;j++) {
+					if (i==j) {
+						m1[i][j]=1;
+						m1[j][i]=1;
+						/////////////
+						m2[i][j]=1;
+						m2[j][i]=1;
+						/////////////
+						m3[i][j]=1;
+						m3[j][i]=1;
+					}else if(j>i) {
+						///////////////////
+						double x=mips_use[i]+mips_use[j];
+						double y1=(mips_use[i]/x)*10;
+						double y2=(mips_use[j]/x)*10;
+						m1[i][j]=y1/y2;
+						m1[j][i]=y2/y1;	
+						////////////////////
+						x=mips[i]+mips[j];
+						y1=(mips[i]/x)*10;
+						y2=(mips[j]/x)*10;
+						m2[i][j]=y1/y2;
+						m2[j][i]=y2/y1;
+						////////////////////
+						x=currentBw[i]+currentBw[j];
+						y1=(currentBw[i]/x)*10;
+						y2=(currentBw[j]/x)*10;
+						m3[i][j]=y1/y2;
+						m3[j][i]=y2/y1;
+						
+					}
+				}
+			}
+			double s1=0;
+			double s2=0;
+			double s3=0;
+			for(int i=0;i<this.getVmList().size()/2;i++) {
+	double multi1=1;
+	double multi2=1;
+	double multi3=1;
+	for(int j=0;j<this.getVmList().size()/2;j++) {
+		multi1=multi1*m1[i][j];
+		multi2=multi2*m2[i][j];
+		multi3=multi3*m3[i][j];
+	}
+	m1[i][msize-1]=Math.pow(multi1, 1/(msize-1));
+	m2[i][msize-1]=Math.pow(multi2, 1/(msize-1));
+	m3[i][msize-1]=Math.pow(multi3, 1/(msize-1));
+	s1=s1+m1[i][msize-1];
+	s2=s2+m2[i][msize-1];
+	s3=s3+m3[i][msize-1];
+			}
+			for(int i=0;i<this.getVmList().size()/2;i++) {
+				m1[i][msize-1]=m1[i][msize-1]/s1;
+				m2[i][msize-1]=m2[i][msize-1]/s2;
+				m3[i][msize-1]=m3[i][msize-1]/s3;
+			}
+			System.out.println("test");
+			
+			
+		}
+		
+		
+		
+		
+		
+		
+		
+		
+		
+		
+		
+		
+		
+		
+		
+		
+		
+		
+		
+		
+//		//find best mel by BW
+//		int bestMelId=-1;
+//		int thresholdQueueForSendToCloud=20;
+//		//for first run 
+//		for(int i=0;i<this.getVmList().size()/2;i++) {
+//			MEL mel = (MEL) this.getVmList().get(i);
+//			
+//			if (mel.getFlowList().size()==0 ){
+//				bestMelId=mel.getId();
+//				break;
+//			}
+//		}
+//		
+//		if(bestMelId==-1) {
+//			double min_delay=Double.MAX_VALUE;
+//			for(int i=0;i<this.getVmList().size()/2;i++) {
+//				long sum_mips=0;
+//				MEL mel = (MEL) this.getVmList().get(i);
+//				for(int j=0;j<mel.getFlowList().size();j++) {
+//					sum_mips += mel.getFlowList().get(j).getOsmesisEdgeletSize();		
+//				}
+//				double d=(a_queue*(1/((flow.getOsmesisEdgeletSize()/mel.getMips())-sum_mips)))+(a_exe*flow.getOsmesisEdgeletSize()/mel.getMips());
+//				if(d<min_delay) {
+//					bestMelId=mel.getId();
+//					min_delay=d;
+//				}
+//			}
+//		}
+		//****************************************/
+		
+//		if(bestMelId==-1) {
+//			Random rand = null;
+//			bestMelId = this.getVmList().get(0).getId() + (int)(Math.random() * ((this.getVmList().get(this.getVmList().size()-1).getId() - this.getVmList().get(0).getId()) + 1));	
+//		}
+		
+//		//find vm by BW
+//		double bw=-1;
+//		if(bestMelId==-2) {
+//			for(int i=0;i<this.getVmList().size()/2;i++) {
+//				MEL mel = (MEL) this.getVmList().get(i);
+//				System.out.println(mel.getCurrentBw());
+//				if (mel.getCurrentBw()>bw) {
+//					bestMelId=this.getVmList().get(i).getId();
+//					bw=mel.getCurrentBw();
+//				}
+//			}
+//		}
+//		
+//		//find best mel by queue
+//		double flowListSize=Double.POSITIVE_INFINITY;
+//		if(bestMelId==-1) {
+//			for(int i=0;i<this.getVmList().size()/2;i++) {
+//				MEL mel = (MEL) this.getVmList().get(i);
+//				System.out.println(mel.getId() + "======"+mel.getFlowList().size());
+//				if (mel.getFlowList().size()<flowListSize) {
+//					bestMelId=mel.getId();
+//					flowListSize=mel.getFlowList().size();
+//				}
+//			}
+//		}
+
+		
+		
+//		System.out.println(bestMelId);
+//		flow.setDestination(bestMelId);
+//		flow.setAppNameDest(getMelNameById(flow));
+		
+		
+		this.flowList.add(flow);
+		flowListHis.add(flow);
+		
+		Vm vm = null;
+		for(Vm getVm : this.getVmList()){
+			if(getVm.getId() == flow.getDestination()){		
+				vm = getVm;
+				break;
+			}
+		}	
+		
+		if(vm != null){
+			MEL mel = (MEL) vm;
+			mel.addFlow(flow);
+		}		
+		
+		updateAllFlowsBw();
+		flow.setPreviousTime(CloudSim.clock());
+		determineEarliestFinishingFlow();
+		
+	}
+
+	private void determineEarliestFinishingFlow() {
+		
+		CloudSim.cancelAll(getId(), new PredicateType(OsmosisTags.INTERNAL_EVENT));
+		double eft = Double.MAX_VALUE;
+		double finishingTime;
+		
+		if(flowList.size() != 0) {
+			for(Flow flow : this.flowList){			
+				finishingTime = flow.FinishingTime();
+				if(finishingTime < eft){
+					eft = finishingTime;
+				}
+			}			
+			send(this.getId(), eft,  OsmosisTags.INTERNAL_EVENT);
+		}
+	}
+
+	@Override
+	public void initCloudTopology(List<HostEntity> hostEntites, List<SwitchEntity> switchEntites,
+			List<LinkEntity> linkEntites) {
+		// TODO Auto-generated method stub		
+	}
+	
+	@Override
+	public void initEdgeTopology(List<EdgeDevice> devices, List<SwitchEntity> switchEntites, List<LinkEntity> linkEntites){
+		this.hosts.addAll(devices); 
+		topology  = new Topology();		 
+		sdnhosts = new ArrayList<SDNHost>();
+		switches= new ArrayList<Switch>();
+		
+		Hashtable<String,Integer> nameIdTable = new Hashtable<String, Integer>();
+					    		    		    
+		for(EdgeDevice device : devices){
+												
+			String hostName = device.getDeviceName();					
+			SDNHost sdnHost = new SDNHost(device, hostName);
+			nameIdTable.put(hostName, sdnHost.getAddress());											
+			this.topology.addNode(sdnHost);		
+			this.sdnhosts.add(sdnHost);			
+		}
+	
+		for(SwitchEntity switchEntity : switchEntites){							
+			long iops = switchEntity.getIops();
+			String switchName = switchEntity.getName();
+			String swType = switchEntity.getType();
+			Switch sw = null;
+			sw = new Switch(switchName,swType, iops);					
+			if(sw != null) {
+				nameIdTable.put(switchName, sw.getAddress());
+				this.topology.addNode(sw);
+				this.switches.add(sw);
+			}
+		}
+			
+		for(LinkEntity linkEntity : linkEntites){									
+				String src = linkEntity.getSource();  
+				String dst = linkEntity.getDestination();				
+				long bw = linkEntity.getBw();
+				int srcAddress = nameIdTable.get(src);
+				if(dst.equals("")){
+					System.out.println("Null!");			
+				}
+				int dstAddress = nameIdTable.get(dst);
+				topology.addLink(srcAddress, dstAddress, bw);
+		}
+	}
+
+}
